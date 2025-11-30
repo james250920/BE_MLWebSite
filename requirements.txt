@@ -7,3 +7,4 @@ numpy
 tensorflow
 scikit-learn
 pandas
+pydub

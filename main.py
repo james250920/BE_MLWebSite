@@ -21,9 +21,16 @@ app.add_middleware(
 @app.get("/")
 async def root():
     return {
-        "message": "API de clasificación de audio",
+        "message": "API de clasificación de audio y conversión",
         "status": "online",
-        "endpoints": ["/api/ml/predict"]
+        "endpoints": {
+            "prediction": "/api/dl/predict",
+            "conversion": "/api/dl/convert-to-wav",
+            "convert_and_predict": "/api/dl/convert-and-predict",
+            "model_info": "/api/dl/model-info",
+            "health": "/api/dl/health",
+            "docs": "/docs"
+        }
     }
 
 @app.get("/health")
@@ -33,7 +40,7 @@ async def health_check():
 # Importar y registrar el router después de crear la app
 # Esto evita problemas de importación circular con TensorFlow en Windows
 from API.apiML import router as ml_router
-app.include_router(ml_router, prefix="/api/ml", tags=["Machine Learning"])
+app.include_router(ml_router, prefix="/api/dl", tags=["Deep Learning"])
 
 if __name__ == "__main__":
     # Usar workers=1 para evitar problemas con TensorFlow en Windows

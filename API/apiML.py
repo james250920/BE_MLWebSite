@@ -1,16 +1,16 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 import librosa
 import numpy as np
 import os
 import tempfile
 from tensorflow import keras
 from typing import Dict, Any
+from pydub import AudioSegment
 
 router = APIRouter()
 
-# Cargar el modelo al iniciar
-MODEL_PATH = "resources/modelo1.h5"
+MODEL_PATH = "resources/deepfake_detector_cnn.h5"
 model = None
 
 try:
@@ -19,78 +19,54 @@ try:
 except Exception as e:
     print(f"Error al cargar el modelo: {str(e)}")
 
-# Configuración de preprocesamiento de audio
-SAMPLE_RATE = 22050
-DURATION = 3  # segundos
-N_MFCC = 40
+SR = 16000
+DURATION = 3.0
+N_FFT = 2048
+HOP_LENGTH = 512
+N_MELS = 128
 
 def preprocess_audio(file_path: str) -> np.ndarray:
-    """
-    Preprocesa el archivo de audio para la predicción.
-    Extrae características MFCC del audio.
-    """
     try:
-        # Cargar audio
-        audio, sr = librosa.load(file_path, sr=SAMPLE_RATE, duration=DURATION)
+        audio, sample_rate = librosa.load(file_path, sr=SR, duration=DURATION)
         
-        # Extraer características MFCC
-        mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=N_MFCC)
+        target_length = int(SR * DURATION)
+        if len(audio) < target_length:
+            audio = np.pad(audio, (0, target_length - len(audio)), mode='constant')
+        else:
+            audio = audio[:target_length]
         
-        # Calcular estadísticas para reducir dimensionalidad
-        mfccs_mean = np.mean(mfccs, axis=1)
-        mfccs_std = np.std(mfccs, axis=1)
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio, 
+            sr=SR, 
+            n_fft=N_FFT, 
+            hop_length=HOP_LENGTH,
+            n_mels=N_MELS
+        )
         
-        # Concatenar características
-        features = np.concatenate([mfccs_mean, mfccs_std])
+        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
         
-        return features
-    
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error al procesar audio: {str(e)}")
-
-def preprocess_audio_cnn(file_path: str) -> np.ndarray:
-    """
-    Preprocesa el audio para modelos CNN (espectrograma o MFCC 2D).
-    """
-    try:
-        # Cargar audio
-        audio, sr = librosa.load(file_path, sr=SAMPLE_RATE, duration=DURATION)
+        mel_spec_db = np.nan_to_num(mel_spec_db)
         
-        # Extraer MFCC como imagen 2D
-        mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=N_MFCC)
+        mel_spec_norm = (mel_spec_db - mel_spec_db.min()) / (mel_spec_db.max() - mel_spec_db.min() + 1e-8)
         
-        # Normalizar
-        mfccs = (mfccs - np.mean(mfccs)) / np.std(mfccs)
+        mel_spec_cnn = np.expand_dims(mel_spec_norm, axis=-1)
         
-        # Ajustar forma para CNN (agregar canal)
-        mfccs = np.expand_dims(mfccs, axis=-1)
-        
-        return mfccs
+        return mel_spec_cnn
     
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al procesar audio: {str(e)}")
 
 @router.post("/predict")
 async def predict_audio(
-    file: UploadFile = File(..., description="Archivo de audio (wav, mp3, etc.)")
+    file: UploadFile = File(..., description="Archivo de audio (wav, mp3, flac, ogg)")
 ) -> Dict[str, Any]:
-    """
-    Endpoint para clasificar un archivo de audio.
-    
-    Args:
-        file: Archivo de audio subido por el cliente
-    
-    Returns:
-        Diccionario con la predicción y probabilidades
-    """
     if model is None:
         raise HTTPException(
             status_code=503,
-            detail="El modelo no está disponible. Verifica que el archivo modelo1.h5 existe."
+            detail="El modelo no está disponible. Verifica que el archivo deepfake_detector_cnn.h5 existe."
         )
     
-    # Validar tipo de archivo
-    allowed_extensions = [".wav", ".mp3", ".ogg", ".flac", ".m4a"]
+    allowed_extensions = [".wav", ".mp3", ".ogg", ".flac"]
     file_extension = os.path.splitext(file.filename)[1].lower()
     
     if file_extension not in allowed_extensions:
@@ -99,7 +75,6 @@ async def predict_audio(
             detail=f"Formato de archivo no soportado. Use: {', '.join(allowed_extensions)}"
         )
     
-    # Guardar archivo temporal
     temp_file = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
@@ -107,46 +82,37 @@ async def predict_audio(
             tmp.write(content)
             temp_file = tmp.name
         
-        # Preprocesar audio - ajusta según tu modelo
-        # Si tu modelo usa CNN, usa preprocess_audio_cnn
-        # Si es un modelo denso/LSTM, usa preprocess_audio
         features = preprocess_audio(temp_file)
         
-        # Preparar para predicción
         features = np.expand_dims(features, axis=0)
         
-        # Realizar predicción
         prediction = model.predict(features, verbose=0)
         
-        # Procesar resultados
-        predicted_class = int(np.argmax(prediction[0]))
-        confidence = float(np.max(prediction[0]))
+        probability_fake = float(prediction[0][0])
+        probability_real = 1.0 - probability_fake
         
-        # Etiquetas de clases - AJUSTA SEGÚN TU MODELO
-        class_labels = {
-            0: "Clase 0",
-            1: "Clase 1",
-            2: "Clase 2",
-            # Agrega más clases según tu modelo
-        }
-        
-        predicted_label = class_labels.get(predicted_class, f"Clase {predicted_class}")
-        
-        # Crear diccionario de probabilidades
-        probabilities = {
-            class_labels.get(i, f"Clase {i}"): float(prob)
-            for i, prob in enumerate(prediction[0])
-        }
+        is_fake = probability_fake > 0.5
+        predicted_class = 1 if is_fake else 0
+        predicted_label = "DEEPFAKE" if is_fake else "REAL"
+        confidence = probability_fake if is_fake else probability_real
         
         return JSONResponse(content={
             "success": True,
             "prediction": {
                 "class": predicted_class,
                 "label": predicted_label,
-                "confidence": confidence
+                "confidence": round(confidence * 100, 2),
+                "is_deepfake": is_fake
             },
-            "probabilities": probabilities,
-            "filename": file.filename
+            "probabilities": {
+                "REAL": round(probability_real * 100, 2),
+                "DEEPFAKE": round(probability_fake * 100, 2)
+            },
+            "audio_info": {
+                "filename": file.filename,
+                "duration_seconds": DURATION,
+                "sample_rate": SR
+            }
         })
     
     except Exception as e:
@@ -156,7 +122,6 @@ async def predict_audio(
         )
     
     finally:
-        # Limpiar archivo temporal
         if temp_file and os.path.exists(temp_file):
             try:
                 os.unlink(temp_file)
@@ -165,9 +130,6 @@ async def predict_audio(
 
 @router.get("/model-info")
 async def model_info() -> Dict[str, Any]:
-    """
-    Obtiene información sobre el modelo cargado.
-    """
     if model is None:
         return {
             "loaded": False,
@@ -177,12 +139,219 @@ async def model_info() -> Dict[str, Any]:
     try:
         return {
             "loaded": True,
+            "model_type": "CNN para detección de deepfakes",
             "input_shape": str(model.input_shape),
             "output_shape": str(model.output_shape),
-            "layers": len(model.layers)
+            "layers": len(model.layers),
+            "parameters": {
+                "sample_rate": SR,
+                "duration": DURATION,
+                "n_mels": N_MELS,
+                "n_fft": N_FFT,
+                "hop_length": HOP_LENGTH
+            },
+            "classes": {
+                "0": "REAL",
+                "1": "DEEPFAKE"
+            }
         }
     except Exception as e:
         return {
             "loaded": True,
             "error": str(e)
         }
+
+@router.get("/health")
+async def health_check() -> Dict[str, Any]:
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "version": "1.0.0"
+    }
+
+@router.post("/convert-to-wav")
+async def convert_to_wav(
+    file: UploadFile = File(..., description="Archivo de audio a convertir a WAV")
+):
+    """
+    Convierte cualquier archivo de audio a formato WAV.
+    
+    Formatos soportados: mp3, opus, m4a, flac, ogg, aac, webm, etc.
+    
+    Returns:
+        Archivo WAV convertido para descargar
+    """
+    allowed_extensions = [".mp3", ".opus", ".m4a", ".flac", ".ogg", ".aac", ".webm", ".wma", ".wav"]
+    file_extension = os.path.splitext(file.filename)[1].lower()
+    
+    if file_extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato no soportado. Formatos válidos: {', '.join(allowed_extensions)}"
+        )
+    
+    temp_input = None
+    temp_output = None
+    
+    try:
+        # Guardar archivo de entrada temporal
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_in:
+            content = await file.read()
+            tmp_in.write(content)
+            temp_input = tmp_in.name
+        
+        # Crear archivo de salida temporal
+        temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.wav').name
+        
+        # Si ya es WAV, solo copiarlo
+        if file_extension == '.wav':
+            import shutil
+            shutil.copy(temp_input, temp_output)
+            output_filename = file.filename
+        else:
+            # Convertir a WAV usando pydub
+            audio = AudioSegment.from_file(temp_input)
+            audio.export(temp_output, format='wav')
+            
+            # Generar nombre de salida
+            base_name = os.path.splitext(file.filename)[0]
+            output_filename = f"{base_name}.wav"
+        
+        # Obtener información del archivo convertido
+        file_size = os.path.getsize(temp_output)
+        
+        # Retornar el archivo como descarga
+        return FileResponse(
+            path=temp_output,
+            media_type='audio/wav',
+            filename=output_filename,
+            headers={
+                "Content-Disposition": f"attachment; filename={output_filename}",
+                "X-Original-Filename": file.filename,
+                "X-File-Size": str(file_size)
+            },
+            background=lambda: cleanup_files([temp_input, temp_output])
+        )
+    
+    except Exception as e:
+        # Limpiar archivos en caso de error
+        if temp_input and os.path.exists(temp_input):
+            try:
+                os.unlink(temp_input)
+            except:
+                pass
+        if temp_output and os.path.exists(temp_output):
+            try:
+                os.unlink(temp_output)
+            except:
+                pass
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al convertir el audio: {str(e)}"
+        )
+
+def cleanup_files(file_paths: list):
+    """Función auxiliar para limpiar archivos temporales después de la descarga."""
+    for file_path in file_paths:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.unlink(file_path)
+            except:
+                pass
+
+@router.post("/convert-and-predict")
+async def convert_and_predict(
+    file: UploadFile = File(..., description="Archivo de audio (cualquier formato)")
+) -> Dict[str, Any]:
+    """
+    Convierte el audio a WAV (si es necesario) y luego realiza la predicción.
+    
+    Este endpoint combina la conversión y predicción en un solo paso.
+    """
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="El modelo no está disponible. Verifica que el archivo deepfake_detector_cnn.h5 exists."
+        )
+    
+    allowed_extensions = [".wav", ".mp3", ".opus", ".m4a", ".flac", ".ogg", ".aac", ".webm"]
+    file_extension = os.path.splitext(file.filename)[1].lower()
+    
+    if file_extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato no soportado. Use: {', '.join(allowed_extensions)}"
+        )
+    
+    temp_input = None
+    temp_wav = None
+    
+    try:
+        # Guardar archivo original
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            temp_input = tmp.name
+        
+        # Convertir a WAV si es necesario
+        if file_extension != '.wav':
+            temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix='.wav').name
+            audio = AudioSegment.from_file(temp_input)
+            audio.export(temp_wav, format='wav')
+            processing_file = temp_wav
+            converted = True
+        else:
+            processing_file = temp_input
+            converted = False
+        
+        # Procesar el audio
+        features = preprocess_audio(processing_file)
+        features = np.expand_dims(features, axis=0)
+        
+        # Realizar predicción
+        prediction = model.predict(features, verbose=0)
+        
+        probability_fake = float(prediction[0][0])
+        probability_real = 1.0 - probability_fake
+        
+        is_fake = probability_fake > 0.5
+        predicted_class = 1 if is_fake else 0
+        predicted_label = "DEEPFAKE" if is_fake else "REAL"
+        confidence = probability_fake if is_fake else probability_real
+        
+        return JSONResponse(content={
+            "success": True,
+            "prediction": {
+                "class": predicted_class,
+                "label": predicted_label,
+                "confidence": round(confidence * 100, 2),
+                "is_deepfake": is_fake
+            },
+            "probabilities": {
+                "REAL": round(probability_real * 100, 2),
+                "DEEPFAKE": round(probability_fake * 100, 2)
+            },
+            "audio_info": {
+                "filename": file.filename,
+                "original_format": file_extension,
+                "converted_to_wav": converted,
+                "duration_seconds": DURATION,
+                "sample_rate": SR
+            }
+        })
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error durante el proceso: {str(e)}"
+        )
+    
+    finally:
+        # Limpiar archivos temporales
+        for temp_file in [temp_input, temp_wav]:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
