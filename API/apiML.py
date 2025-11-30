@@ -173,14 +173,6 @@ async def health_check() -> Dict[str, Any]:
 async def convert_to_wav(
     file: UploadFile = File(..., description="Archivo de audio a convertir a WAV")
 ):
-    """
-    Convierte cualquier archivo de audio a formato WAV.
-    
-    Formatos soportados: mp3, opus, m4a, flac, ogg, aac, webm, etc.
-    
-    Returns:
-        Archivo WAV convertido para descargar
-    """
     allowed_extensions = [".mp3", ".opus", ".m4a", ".flac", ".ogg", ".aac", ".webm", ".wma", ".wav"]
     file_extension = os.path.splitext(file.filename)[1].lower()
     
@@ -194,33 +186,26 @@ async def convert_to_wav(
     temp_output = None
     
     try:
-        # Guardar archivo de entrada temporal
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_in:
             content = await file.read()
             tmp_in.write(content)
             temp_input = tmp_in.name
         
-        # Crear archivo de salida temporal
         temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.wav').name
         
-        # Si ya es WAV, solo copiarlo
         if file_extension == '.wav':
             import shutil
             shutil.copy(temp_input, temp_output)
             output_filename = file.filename
         else:
-            # Convertir a WAV usando pydub
             audio = AudioSegment.from_file(temp_input)
             audio.export(temp_output, format='wav')
             
-            # Generar nombre de salida
             base_name = os.path.splitext(file.filename)[0]
             output_filename = f"{base_name}.wav"
         
-        # Obtener información del archivo convertido
         file_size = os.path.getsize(temp_output)
         
-        # Retornar el archivo como descarga
         return FileResponse(
             path=temp_output,
             media_type='audio/wav',
@@ -234,7 +219,6 @@ async def convert_to_wav(
         )
     
     except Exception as e:
-        # Limpiar archivos en caso de error
         if temp_input and os.path.exists(temp_input):
             try:
                 os.unlink(temp_input)
@@ -252,7 +236,6 @@ async def convert_to_wav(
         )
 
 def cleanup_files(file_paths: list):
-    """Función auxiliar para limpiar archivos temporales después de la descarga."""
     for file_path in file_paths:
         if file_path and os.path.exists(file_path):
             try:
@@ -264,11 +247,6 @@ def cleanup_files(file_paths: list):
 async def convert_and_predict(
     file: UploadFile = File(..., description="Archivo de audio (cualquier formato)")
 ) -> Dict[str, Any]:
-    """
-    Convierte el audio a WAV (si es necesario) y luego realiza la predicción.
-    
-    Este endpoint combina la conversión y predicción en un solo paso.
-    """
     if model is None:
         raise HTTPException(
             status_code=503,
@@ -288,13 +266,11 @@ async def convert_and_predict(
     temp_wav = None
     
     try:
-        # Guardar archivo original
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
             content = await file.read()
             tmp.write(content)
             temp_input = tmp.name
         
-        # Convertir a WAV si es necesario
         if file_extension != '.wav':
             temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix='.wav').name
             audio = AudioSegment.from_file(temp_input)
@@ -305,11 +281,9 @@ async def convert_and_predict(
             processing_file = temp_input
             converted = False
         
-        # Procesar el audio
         features = preprocess_audio(processing_file)
         features = np.expand_dims(features, axis=0)
         
-        # Realizar predicción
         prediction = model.predict(features, verbose=0)
         
         probability_fake = float(prediction[0][0])
@@ -348,7 +322,6 @@ async def convert_and_predict(
         )
     
     finally:
-        # Limpiar archivos temporales
         for temp_file in [temp_input, temp_wav]:
             if temp_file and os.path.exists(temp_file):
                 try:
